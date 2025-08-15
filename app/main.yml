@@ -1,0 +1,987 @@
+
+# © 2022 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+# This AWS Content is provided subject to the terms of the AWS Customer Agreement available at
+# http://aws.amazon.com/agreement or other written agreement between Customer and either
+# Amazon Web Services, Inc. or Amazon Web Services EMEA SARL or both.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'AWS CloudFormation Sample Template:
+ The intention of this template is the creation of the necessary components to analyze a certain group of logs with Macie and alert in case of finding sensitive information.'
+
+Parameters:
+  ResourceName:
+    Type: String
+  # Default: enter-default-name-for-clouformation-stack  - (change stack name here)
+    Description: Prefix of Resources created for this demo.
+  BucketName:
+    Type: String
+  # Default: enter-default-name-for-s3-bucket  - (change bucket name here)
+    Description: 'The name of the S3 Bucket to create, make this unique'
+  LogGroupName:
+    Type: String
+  # Default: enter-cloudwatch-loggroup-name-here  - (change log group name here)
+    Description: 'The name of the CloudWatch Log Group'
+  SNSTopicEndpointEmail:
+  # Default: enter-default-email-id-here  - (change email id here)
+    Description: SNS Topic endpoint - email address
+    Type: String
+  EnableMacie:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set to true only if Macie is NOT already enabled in your account
+
+# Conditions
+Conditions:
+  CreateMacieSession: !Equals [!Ref EnableMacie, 'true']
+
+# Creation of Resources
+Resources:
+# CloudWatch Log Group - must be created before subscription filter
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: 14
+
+# KMS Key
+  KmsKey:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Description: "KMS key for encrypting logs"
+      EnableKeyRotation: true
+      MultiRegion: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: "MacieKmsKeyPolicy"
+        Statement:
+          - Sid: "KMS key for encrypting logs used by macie"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: "Allow use of the key"
+            Effect: "Allow"
+            Principal:
+              AWS:
+              - !GetAtt deliveryRole.Arn
+              - !GetAtt macieDataLambdaRole.Arn
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/macie.amazonaws.com/AWSServiceRoleForAmazonMacie'
+            Action:
+            - 'kms:Encrypt'
+            - 'kms:Decrypt'
+            - 'kms:ReEncrypt*'
+            - 'kms:GenerateDataKey*'
+            - 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+      - Key: Name
+        Value: MacieLogsKey
+  KmsKeyAliasKmsKey:
+    Type: "AWS::KMS::Alias"
+    Properties:
+      AliasName: "alias/MacieLogsKey"
+      TargetKeyId:
+        Ref: "KmsKey"
+# CloudWatch Logs Bucket for finding filtered data.
+  CloudWatchLogsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName:
+        Fn::Join:
+          - '-'
+          - [!Ref "BucketName", !Ref "AWS::AccountId", !Ref "AWS::Region"]
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierRule
+            Status: Enabled
+            ExpirationInDays: '365'
+            Transitions:
+              - TransitionInDays: '90'
+                StorageClass: GLACIER
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      
+  CloudWatchLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudWatchLogsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: "DenyUnEncryptedObjectUploads"
+            Effect: "Deny"
+            Principal:
+              AWS: "*"
+            Action:
+              - "s3:PutObject"
+            Resource:
+              - !Sub "arn:aws:s3:::${CloudWatchLogsBucket}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: "aws:kms"
+          - Sid: "DenyInsecureConnections"
+            Effect: "Deny"
+            Principal:
+              AWS: "*"
+            Action:
+              - "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${CloudWatchLogsBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: False
+          - Sid: "AllowSourceAccountActions"
+            Action:
+              - "s3:Get*"
+              - "s3:Put*"
+            Effect: "Allow"
+            Resource:
+              - !Sub "arn:aws:s3:::${CloudWatchLogsBucket}/*"
+            Principal:
+              AWS:
+                - !Ref AWS::AccountId
+          - Sid: "AllowDestinationAccountActions"
+            Action:
+              - "s3:Get*"
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${CloudWatchLogsBucket}/*
+            Principal:
+              AWS:
+                - !Ref "AWS::AccountId"
+# Data firehose Delivery Stream
+  deliverystream:
+    DependsOn:
+      - deliveryPolicy
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Join
+          - ''
+          - - 'arn:aws:s3:::'
+            - !Ref CloudWatchLogsBucket
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 50
+        CompressionFormat: UNCOMPRESSED
+        Prefix: firehose/
+        RoleARN: !GetAtt deliveryRole.Arn
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !GetAtt KmsKey.Arn
+# Subscription Filter for cloud-watch logs.
+  SubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      RoleArn:
+        Fn::GetAtt:
+          - "CWLtoDataFirehoseRole"
+          - "Arn"
+      LogGroupName:
+        Ref: LogGroupName
+      FilterPattern: '' # Add regex filter pattern here!
+      DestinationArn:
+        Fn::GetAtt:
+          - "deliverystream"
+          - "Arn"
+
+# Creation of roles
+
+#Delivery Stream Role
+  deliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+
+# Lambda Role for Pushing the Data from Maice
+  macieDataLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: !Join [ -, [!Ref ResourceName, 'macieDataLambdaPolicy'] ]
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:DescribeLogStreams
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - s3:DeleteObject
+            - s3:ListBucket
+            - macie2:CreateClassificationJob
+            - kms:Decrypt
+            - kms:GenerateDataKey
+            - kms:DescribeKey
+            Resource: '*'
+          - Effect: Allow
+            Action: s3:PutObject
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref CloudWatchLogsBucket, '*']]
+          - Effect: Allow
+            Action: s3:PutEncryptionConfiguration
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref CloudWatchLogsBucket]]
+
+# Data Firehose Delivery Stream Policy
+  deliveryPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName:
+        Fn::Join:
+          - '-'
+          - ["firehose_delivery_policy", !Ref "AWS::AccountId", !Ref "AWS::Region"]
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DescribeLogStreams
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref CloudWatchLogsBucket
+                  - '*'
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref CloudWatchLogsBucket
+                  - '*'
+      Roles:
+        - !Ref deliveryRole
+
+  # Cloudwatch Logs Bucket to Data Firehose Role
+  CWLtoDataFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service:
+                - !Join
+                  - ''
+                  - - 'logs.'
+                    - !Ref "AWS::Region"
+                    - '.amazonaws.com'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringLike:
+                'aws:SourceArn':
+                  - !Join
+                    - ''
+                    - - 'arn:aws:logs:'
+                      - !Ref "AWS::Region"
+                      - ':'
+                      - !Ref "AWS::AccountId"
+                      - ':'
+                      - '*'
+
+# Data Firehose Policy for CloudWatchLogsBucket
+  firehosePolicyForCWL:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName:
+        Fn::Join:
+          - '-'
+          - ["firehose_for_cwl_policy"]
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - firehose:PutRecordBatch
+              - firehose:PutRecord
+              - firehose:DescribeDeliveryStream
+              - firehose:UpdateDestination
+              - firehose:CreateDeliveryStream
+              - firehose:DeleteDeliveryStream
+              - firehose:ListDeliveryStreams
+              - firehose:StartDeliveryStreamEncryption
+              - firehose:StopDeliveryStreamEncryption
+              - firehose:TagDeliveryStream
+              - firehose:UntagDeliveryStream
+              - firehose:ListTagsForDeliveryStream
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:firehose:'
+                  - !Ref "AWS::Region"
+                  - ':'
+                  - !Ref "AWS::AccountId"
+                  - ':'
+                  - '*'
+      Roles:
+        - !Ref CWLtoDataFirehoseRole
+
+# Macie Job Session
+  macieSession:
+    Type: AWS::Macie::Session
+    Condition: CreateMacieSession
+    Properties:
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Status: ENABLED
+
+# Macie Custom Data identifier
+  macieCustomDataIdentifier:
+    Type: AWS::Macie::CustomDataIdentifier
+    Condition: CreateMacieSession
+    DependsOn: macieSession
+    Properties:
+        Description: "My custom data identifier"
+        IgnoreWords:
+            - "000000"
+            - "123456"
+        Keywords:
+            - "patentID"
+            - "patentid"
+            - "patent"
+        MaximumMatchDistance: 50
+        Name: !Join [ -, [!Ref ResourceName, 'macie', 'employeeid', 'custom', 'data', 'identifier'] ]
+        Regex: AnyCompany-\d{8}
+
+# Customer Resource for Macie Job created using Lambda functions.
+  macieDataLambda:
+    DependsOn:
+      - deliverystream
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: macieDataLambda
+      Handler: "index.lambda_handler"
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 500
+      Role: !GetAtt macieDataLambdaRole.Arn
+      ReservedConcurrentExecutions: 100
+      Code:
+        ZipFile: |
+            import boto3, logging, os
+            import json
+            import datetime
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+            AccountId = os.environ['AccountId']
+            BucketMacie = os.environ['BucketMacie']
+            CustomDataIdentifierID = os.environ['CustomDataIdentifierID']
+            def lambda_handler(event, context):
+                logger.info("event: {}".format(event))
+                try:
+                    client = boto3.client('macie2')
+                    today = datetime.datetime.now().strftime("%m_%d_%Y_%H_%M_%S")
+                    job_name = f'macie_classification_job_{AccountId}_{today}'
+                    response = client.create_classification_job(
+                    customDataIdentifierIds=[ CustomDataIdentifierID ],
+                    description='macie',
+                    jobType='ONE_TIME',
+                    name=job_name,
+                    s3JobDefinition={
+                        'bucketDefinitions': [
+                            {
+                                'accountId': AccountId,
+                                'buckets': [ BucketMacie ]
+                            }
+                        ]}
+                    )
+
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps(f'Job {job_name} was created successfully')
+                    }
+                except Exception as e:
+                    logger.info("Exception: {}".format(e))
+                    return {
+                        'statusCode': 500,
+                        'body': json.dumps("Exception: {}".format(e))
+                    }
+      Environment:
+        Variables:
+          Region:
+            !Ref "AWS::Region"
+          AccountId:
+            !Ref "AWS::AccountId"
+          CustomDataIdentifierID: !If 
+            - CreateMacieSession
+            - !GetAtt macieCustomDataIdentifier.Id
+            - "NONE"
+          BucketMacie:
+            Fn::Join:
+              - '-'
+              - [!Ref "BucketName", !Ref "AWS::AccountId", !Ref "AWS::Region"]
+
+# EventBridge Rule for Triggering the Data Isolation
+  MacieDataEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "macieDataLambdaInvoke"
+      Description: "ScheduledRule"
+      ScheduleExpression: cron(0 4 ? * * *)
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt macieDataLambda.Arn
+          Id: "MacieLambdaEventFunctionId"
+      EventBusName: "default"
+
+# EventBridge Trigger
+  macieDataTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt macieDataLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MacieDataEventRule.Arn
+
+# Notification items
+# Simple Notification Service - Topic Creation
+  SNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: ""
+      TopicName: "macie-eventbridge-topic"
+      KmsMasterKeyId: !Ref KmsKey
+
+# Simple Notification Service - Topic Policy
+  SNSTopicPolicy:
+    Type: "AWS::SNS::TopicPolicy"
+    Properties:
+      PolicyDocument: !Sub |
+        {
+            "Version": "2008-10-17",
+            "Id": "default_policy_id",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "AWS": "*"
+                    },
+                    "Action": [
+                        "SNS:GetTopicAttributes",
+                        "SNS:SetTopicAttributes",
+                        "SNS:AddPermission",
+                        "SNS:RemovePermission",
+                        "SNS:DeleteTopic",
+                        "SNS:Subscribe",
+                        "SNS:ListSubscriptionsByTopic",
+                        "SNS:Publish",
+                        "SNS:Receive"
+                    ],
+                    "Resource": "${SNSTopic}",
+                    "Condition": {
+                        "StringEquals": {
+                            "AWS:SourceOwner": "${AWS::AccountId}"
+                        }
+                    }
+                },
+                {
+                    "Sid": "awsevent_macie_rule_id",
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Service": "events.amazonaws.com"
+                    },
+                    "Action": "sns:Publish",
+                    "Resource": "${SNSTopic}"
+                },
+                {
+                  "Sid": "AllowPublishThroughSSLOnly",
+                  "Action": "SNS:Publish",
+                  "Effect": "Deny",
+                  "Resource": "${SNSTopic}",
+                  "Condition": {
+                    "Bool": {
+                      "aws:SecureTransport": "false"
+                    }
+                  },
+                  "Principal": "*"
+                }
+            ]
+        }
+      Topics:
+        - !Ref SNSTopic
+
+# Simple Notification Service - Subscription using Email
+  SNSSubscriptionEmail:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Endpoint: !Ref SNSTopicEndpointEmail
+      Protocol: "email"
+      Region: !Ref AWS::Region
+  DataIsolationBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "macie-isolation-${AWS::AccountId}-${AWS::Region}"
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierRule
+            Status: Enabled
+            ExpirationInDays: '365'
+            Transitions:
+              - TransitionInDays: '90'
+                StorageClass: GLACIER
+  DataIsolationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataIsolationBucket
+      PolicyDocument:
+        Statement:
+          - Sid: "DenyUnEncryptedObjectUploads"
+            Effect: "Deny"
+            Principal:
+              AWS: "*"
+            Action:
+              - "s3:PutObject"
+            Resource:
+              - !Sub "arn:aws:s3:::${DataIsolationBucket}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: "aws:kms"
+          - Sid: "DenyInsecureConnections"
+            Effect: "Deny"
+            Principal:
+              AWS: "*"
+            Action:
+              - "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${DataIsolationBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: False
+          - Sid: "AllowSourceAccountActions"
+            Action:
+              - "s3:Get*"
+              - "s3:Put*"
+            Effect: "Allow"
+            Resource:
+              - !Sub "arn:aws:s3:::${DataIsolationBucket}/*"
+            Principal:
+              AWS:
+                - !Ref AWS::AccountId
+          - Sid: "AllowDestinationAccountActions"
+            Action:
+              - "s3:Get*"
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${DataIsolationBucket}/*
+            Principal:
+              AWS:
+                - !Ref "AWS::AccountId"
+  MacieLambdaEventExecutionPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Path: "/service-role/"
+      PolicyDocument: !Sub |
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "logs:CreateLogGroup",
+                    "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents"
+                    ],
+                    "Resource": [
+                        "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/macie-lambda-events:*"
+                    ]
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "kms:Decrypt",
+                        "kms:Encrypt",
+                        "kms:GenerateDataKey",
+                        "kms:DescribeKey"
+                    ],
+                    "Resource": [
+                        "${KmsKey.Arn}"
+                    ]
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:PutObject",
+                        "s3:GetObject",
+                        "s3:DeleteObject"
+                    ],
+                    "Resource": [
+                        "arn:aws:s3:::${CloudWatchLogsBucket}/*",
+                        "arn:aws:s3:::${DataIsolationBucket}/*"
+                    ]
+                }
+            ]
+        }
+  MacieLambdaEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - !Ref MacieLambdaEventExecutionPolicy
+  MacieLambdaEventFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Moves and deletes S3 objects flagged by Amazon Macie"
+      FunctionName: "macie-lambda-events"
+      Handler: "index.lambda_handler"
+      ReservedConcurrentExecutions: 100
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3, os
+          from botocore.exceptions import ClientError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3_client = boto3.client('s3')
+          def lambda_handler(event, context):
+              logging.info(f'event: {json.dumps(event)}')
+              destination_bucket_name = os.environ['BucketDestination']
+              kms_key = os.environ['KmsKey']
+              source_bucket_name = event['detail']['resourcesAffected']['s3Bucket']['name']
+              file_key_name = event['detail']['resourcesAffected']['s3Object']['key']
+              copy_source_object = {'Bucket': source_bucket_name, 'Key': file_key_name}
+              logging.debug(f'destination_bucket_name: {destination_bucket_name}')
+              logging.debug(f'source_bucket_name: {source_bucket_name}')
+              logging.debug(f'file_key_name: {file_key_name}')
+              try:
+                  response = s3_client.copy_object(
+                      CopySource=copy_source_object,
+                      Bucket=destination_bucket_name,
+                      Key=file_key_name,
+                      ServerSideEncryption='aws:kms',
+                      SSEKMSKeyId=kms_key,
+                  )
+                  logger.info(response)
+              except ClientError as ex:
+                  logger.error(ex)
+                  exit(1)
+              try:
+                  response = s3_client.delete_object(
+                      Bucket=source_bucket_name,
+                      Key=file_key_name
+                  )
+                  logger.info(response)
+              except ClientError as ex:
+                  logger.error(ex)
+                  exit(1)
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(copy_source_object)
+              }
+      MemorySize: 128
+      Role: !GetAtt MacieLambdaEventRole.Arn
+      Runtime: "python3.13"
+      Timeout: 3
+      TracingConfig:
+        Mode: "PassThrough"
+      Environment:
+        Variables:
+          BucketDestination:
+            !Ref DataIsolationBucket
+          KmsKey:
+            !GetAtt KmsKey.KeyId
+  
+  # Test Data Generator Lambda Function
+  TestDataGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourceName}-test-data-generator"
+      Handler: "index.lambda_handler"
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt TestDataGeneratorRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import datetime
+          import random
+          import os
+          
+          def lambda_handler(event, context):
+              logs_client = boto3.client('logs')
+              log_group_name = os.environ['LOG_GROUP_NAME']
+              
+              # Create a test log stream
+              timestamp = int(datetime.datetime.now().timestamp())
+              stream_name = f"test-stream-{timestamp}"
+              
+              try:
+                  logs_client.create_log_stream(
+                      logGroupName=log_group_name,
+                      logStreamName=stream_name
+                  )
+              except logs_client.exceptions.ResourceAlreadyExistsException:
+                  pass
+              
+              # Generate test messages with sensitive data
+              test_messages = [
+                  f"User login for employee AnyCompany-{random.randint(10000000, 99999999)}",
+                  f"Processing patent patentID: AnyCompany-{random.randint(10000000, 99999999)}",
+                  f"Credit card: 4532-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}",
+                  f"SSN: {random.randint(100, 999)}-{random.randint(10, 99)}-{random.randint(1000, 9999)}",
+                  "Normal log entry - system operational",
+                  "Database connection established",
+                  f"API request processed - response time {random.randint(50, 500)}ms"
+              ]
+              
+              # Prepare log events
+              log_events = []
+              base_timestamp = timestamp * 1000
+              
+              for i, message in enumerate(test_messages):
+                  log_events.append({
+                      'timestamp': base_timestamp + (i * 1000),
+                      'message': message
+                  })
+              
+              # Send log events
+              response = logs_client.put_log_events(
+                  logGroupName=log_group_name,
+                  logStreamName=stream_name,
+                  logEvents=log_events
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Generated {len(test_messages)} test log entries',
+                      'logStream': stream_name,
+                      'logGroup': log_group_name
+                  })
+              }
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref LogGroupName
+
+  # IAM Role for Test Data Generator
+  TestDataGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*"
+
+  MacieEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: "macie-rule"
+      Description: "Amazon Macie - High Finding"
+      EventPattern: |
+        {
+          "source": ["aws.macie"],
+          "detail-type": ["Macie Finding"],
+          "detail": {
+            "severity": {
+              "description": ["High"]
+            }
+          }
+        }
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt MacieLambdaEventFunction.Arn
+          Id: "MacieLambdaEventFunctionId"
+        - Arn: !Ref SNSTopic
+          Id: "MacieEventRuleSNSTopicId"
+          InputTransformer:
+            InputPathsMap:
+              account: $.account
+              type: $.detail-type
+              id: $.detail.classificationDetails.jobId
+              file: $.detail.resourcesAffected.s3Object.path
+              severity: $.detail.severity.description
+            InputTemplate: |
+              "Amazon Macie Finding Notification: Job Id <id>, AWS Account <account>. Severity of <severity> for file '<file>'."
+      EventBusName: "default"
+  LambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt MacieLambdaEventFunction.Arn
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt MacieEventRule.Arn
+
+# Outputs for testing and reference
+Outputs:
+  StackName:
+    Description: "Name of the CloudFormation stack"
+    Value: !Ref "AWS::StackName"
+    Export:
+      Name: !Sub "${AWS::StackName}-StackName"
+  
+  CloudWatchLogGroup:
+    Description: "CloudWatch Log Group for testing"
+    Value: !Ref CloudWatchLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup"
+  
+  CloudWatchLogsBucket:
+    Description: "S3 bucket for CloudWatch logs"
+    Value: !Ref CloudWatchLogsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-LogsBucket"
+  
+  DataIsolationBucket:
+    Description: "S3 bucket for isolated sensitive data"
+    Value: !Ref DataIsolationBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-IsolationBucket"
+  
+  SNSTopicArn:
+    Description: "SNS Topic ARN for notifications"
+    Value: !Ref SNSTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopic"
+  
+  KMSKeyId:
+    Description: "KMS Key ID for encryption"
+    Value: !GetAtt KmsKey.KeyId
+    Export:
+      Name: !Sub "${AWS::StackName}-KMSKey"
+  
+  KMSKeyArn:
+    Description: "KMS Key ARN for encryption"
+    Value: !GetAtt KmsKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KMSKeyArn"
+  
+  MacieDataLambdaFunction:
+    Description: "Lambda function for triggering Macie jobs"
+    Value: !Ref macieDataLambda
+    Export:
+      Name: !Sub "${AWS::StackName}-MacieDataLambda"
+  
+  MacieEventLambdaFunction:
+    Description: "Lambda function for handling Macie events"
+    Value: !Ref MacieLambdaEventFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-MacieEventLambda"
+  
+  TestDataGeneratorFunction:
+    Description: "Lambda function for generating test data"
+    Value: !Ref TestDataGeneratorFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-TestDataGenerator"
+  
+  FirehoseDeliveryStream:
+    Description: "Kinesis Data Firehose delivery stream"
+    Value: !Ref deliverystream
+    Export:
+      Name: !Sub "${AWS::StackName}-FirehoseStream"
+  
+  MacieEventRule:
+    Description: "EventBridge rule for Macie findings"
+    Value: !Ref MacieEventRule
+    Export:
+      Name: !Sub "${AWS::StackName}-MacieEventRule"
+  
+  MacieDataEventRule:
+    Description: "EventBridge rule for scheduled Macie jobs"
+    Value: !Ref MacieDataEventRule
+    Export:
+      Name: !Sub "${AWS::StackName}-MacieDataEventRule"
+  
+  MacieCustomDataIdentifier:
+    Condition: CreateMacieSession
+    Description: "Macie custom data identifier ID"
+    Value: !GetAtt macieCustomDataIdentifier.Id
+    Export:
+      Name: !Sub "${AWS::StackName}-MacieCustomDataIdentifier"
+  
+  MacieSessionStatus:
+    Condition: CreateMacieSession
+    Description: "Macie session status"
+    Value: "ENABLED"
+    Export:
+      Name: !Sub "${AWS::StackName}-MacieSessionStatus"
+  
+  DeploymentRegion:
+    Description: "AWS region where the stack is deployed"
+    Value: !Ref "AWS::Region"
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+  
+  AccountId:
+    Description: "AWS Account ID"
+    Value: !Ref "AWS::AccountId"
+    Export:
+      Name: !Sub "${AWS::StackName}-AccountId"
