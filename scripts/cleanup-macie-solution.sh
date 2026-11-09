@@ -120,6 +120,7 @@ empty_buckets() {
         local bucket_patterns=(
             "*macie-logs-bucket*-${account_id}-${REGION}"
             "macie-isolation-${account_id}-${REGION}"
+            "access-logs-${account_id}-${REGION}"
         )
         
         for pattern in "${bucket_patterns[@]}"; do
@@ -147,6 +148,12 @@ empty_buckets() {
     if [ -n "$isolation_bucket" ]; then
         empty_single_bucket "$isolation_bucket"
     fi
+
+    # Empty S3 server access logs bucket
+    local access_logs_bucket=$(get_stack_resource "AccessLogsBucket")
+    if [ -n "$access_logs_bucket" ]; then
+        empty_single_bucket "$access_logs_bucket"
+    fi
     
     log_success "S3 buckets emptied"
 }
@@ -169,7 +176,7 @@ empty_single_bucket() {
     if [ "$object_count" -gt 0 ]; then
         log_info "Removing $object_count objects from $bucket_name"
         
-        # Remove all objects and versions
+        # Remove all current objects
         aws s3 rm "s3://$bucket_name" --recursive --region "$REGION" || true
         
         # Remove any incomplete multipart uploads
@@ -190,8 +197,30 @@ empty_single_bucket() {
         
         log_success "Bucket $bucket_name emptied"
     else
-        log_info "Bucket $bucket_name is already empty"
+        log_info "Bucket $bucket_name has no current objects"
     fi
+
+    # Buckets are versioned: remove all object versions and delete markers,
+    # otherwise CloudFormation cannot delete the bucket.
+    log_info "Removing object versions and delete markers from $bucket_name"
+    local field batch
+    for field in Versions DeleteMarkers; do
+        while true; do
+            batch=$(aws s3api list-object-versions \
+                --bucket "$bucket_name" \
+                --region "$REGION" \
+                --max-items 1000 \
+                --output json \
+                --query "{Objects: ${field}[].{Key:Key,VersionId:VersionId}, Quiet: \`true\`}" 2>/dev/null) || break
+            if [ -z "$batch" ] || echo "$batch" | grep -q '"Objects": null'; then
+                break
+            fi
+            aws s3api delete-objects \
+                --bucket "$bucket_name" \
+                --region "$REGION" \
+                --delete "$batch" >/dev/null || break
+        done
+    done
 }
 
 # Function to delete CloudFormation stack
