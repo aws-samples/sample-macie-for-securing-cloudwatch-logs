@@ -94,6 +94,16 @@ Resources:
           - '-'
           - [!Ref "BucketName", !Ref "AWS::AccountId", !Ref "AWS::Region"]
       AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: cloudwatch-logs-bucket/
       LifecycleConfiguration:
         Rules:
           - Id: GlacierRule
@@ -102,10 +112,83 @@ Resources:
             Transitions:
               - TransitionInDays: '90'
                 StorageClass: GLACIER
+          # Objects flagged by Macie are moved to the isolation bucket and deleted here.
+          # With versioning on, purge the leftover noncurrent version quickly so
+          # sensitive data does not linger in this bucket.
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: 'AES256'
+
+# S3 server access logs bucket for CloudWatchLogsBucket and DataIsolationBucket.
+  AccessLogsBucket:
+    Type: 'AWS::S3::Bucket'
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "This is the access logs destination bucket; logging it to itself would loop."
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED
+    Properties:
+      BucketName: !Sub "${BucketName}-access-logs-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "DenyInsecureConnections"
+            Effect: "Deny"
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub "${AccessLogsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: "AllowS3ServerAccessLogDelivery"
+            Effect: "Allow"
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: "s3:PutObject"
+            Resource: !Sub "${AccessLogsBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  - !Sub "arn:aws:s3:::${BucketName}-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::macie-isolation-${AWS::AccountId}-${AWS::Region}"
       
   CloudWatchLogsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -131,6 +214,7 @@ Resources:
             Action:
               - "s3:*"
             Resource:
+              - !Sub "arn:aws:s3:::${CloudWatchLogsBucket}"
               - !Sub "arn:aws:s3:::${CloudWatchLogsBucket}/*"
             Condition:
               Bool:
@@ -546,6 +630,16 @@ Resources:
     Properties:
       BucketName: !Sub "macie-isolation-${AWS::AccountId}-${AWS::Region}"
       AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: data-isolation-bucket/
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -582,6 +676,7 @@ Resources:
             Action:
               - "s3:*"
             Resource:
+              - !Sub "arn:aws:s3:::${DataIsolationBucket}"
               - !Sub "arn:aws:s3:::${DataIsolationBucket}/*"
             Condition:
               Bool:
